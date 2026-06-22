@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import math
+import re
 from xml.etree import ElementTree as ET
 
 from .drawingml_context import AffineMatrix, ConvertContext, IDENTITY_MATRIX
@@ -26,6 +26,23 @@ INHERITABLE_ATTRS = [
     'font-family', 'font-size', 'font-weight', 'font-style',
     'text-anchor', 'letter-spacing', 'text-decoration',
 ]
+
+# Korean fonts and common localized aliases. Keeping this separate lets
+# parse_font_family retain a Korean-specific typeface alongside the generic
+# East-Asian slot used by Chinese/Japanese runs.
+KOREAN_FONTS = {
+    'Malgun Gothic', 'Malgun Gothic Semilight', '맑은 고딕',
+    'Gulim', 'GulimChe', '굴림', '굴림체',
+    'Dotum', 'DotumChe', '돋움', '돋움체',
+    'Batang', 'BatangChe', '바탕', '바탕체',
+    'Gungsuh', 'GungsuhChe', '궁서', '궁서체',
+    'Apple SD Gothic Neo', 'AppleGothic',
+    'Noto Sans KR', 'Noto Sans CJK KR',
+    'Noto Serif KR', 'Noto Serif CJK KR',
+    'Source Han Sans KR', 'Source Han Serif KR',
+    'Nanum Gothic', 'NanumGothic',
+    'Nanum Myeongjo', 'NanumMyeongjo',
+}
 
 # Known East Asian fonts
 EA_FONTS = {
@@ -56,10 +73,7 @@ EA_FONTS = {
     'Yu Gothic', 'Yu Gothic UI', 'Yu Mincho',
     'Meiryo', 'Meiryo UI', 'メイリオ',
     'MS Gothic', 'MS Mincho', 'MS PGothic', 'MS PMincho', 'MS UI Gothic',
-    # Korean
-    'Malgun Gothic', 'Gulim', 'Dotum', 'Batang',
-    'Noto Sans KR', 'Noto Serif KR',
-}
+} | KOREAN_FONTS
 SYSTEM_FONTS = {'system-ui', '-apple-system', 'BlinkMacSystemFont'}
 
 # macOS/Linux-only fonts -> Windows equivalents
@@ -94,6 +108,28 @@ FONT_FALLBACK_WIN = {
     'Source Han Serif JP': 'Noto Serif JP',
     'WenQuanYi Micro Hei': 'Microsoft YaHei',
     'WenQuanYi Zen Hei': 'Microsoft YaHei',
+    # Korean: use Office/Windows-safe family names in generated PPTX files.
+    '맑은 고딕': 'Malgun Gothic',
+    '굴림': 'Gulim',
+    '굴림체': 'GulimChe',
+    '돋움': 'Dotum',
+    '돋움체': 'DotumChe',
+    '바탕': 'Batang',
+    '바탕체': 'BatangChe',
+    '궁서': 'Gungsuh',
+    '궁서체': 'GungsuhChe',
+    'Apple SD Gothic Neo': 'Malgun Gothic',
+    'AppleGothic': 'Malgun Gothic',
+    'Noto Sans KR': 'Malgun Gothic',
+    'Noto Sans CJK KR': 'Malgun Gothic',
+    'Source Han Sans KR': 'Malgun Gothic',
+    'Nanum Gothic': 'Malgun Gothic',
+    'NanumGothic': 'Malgun Gothic',
+    'Noto Serif KR': 'Batang',
+    'Noto Serif CJK KR': 'Batang',
+    'Source Han Serif KR': 'Batang',
+    'Nanum Myeongjo': 'Batang',
+    'NanumMyeongjo': 'Batang',
     # Latin fonts (macOS / Linux / Web -> Windows)
     'SF Pro': 'Segoe UI',
     'SF Pro Display': 'Segoe UI',
@@ -119,8 +155,8 @@ GENERIC_FONT_MAP = {
     'serif': 'Times New Roman',
 }
 
-# When the latin font is serif and no EA font is specified,
-# prefer SimSun (serif CJK) over Microsoft YaHei (sans-serif CJK).
+# When the latin font is serif and no EA/Korean font is specified, prefer a
+# serif fallback for that script.
 _SERIF_LATIN = {
     'Times New Roman', 'Georgia', 'Garamond', 'Palatino', 'Palatino Linotype',
     'Book Antiqua', 'Cambria', 'SimSun', 'Liberation Serif', 'DejaVu Serif',
@@ -393,17 +429,24 @@ def get_effective_filter_id(elem: ET.Element, ctx: ConvertContext) -> str | None
 # ---------------------------------------------------------------------------
 
 def parse_font_family(font_family_str: str) -> dict[str, str]:
-    """Parse CSS font-family into latin/ea typeface names.
+    """Parse CSS font-family into latin/ea/ko typeface names.
 
     Prioritizes Windows-available fonts since PPTX is primarily opened on
-    Windows. macOS/Linux-only fonts are mapped via FONT_FALLBACK_WIN.
+    Windows. macOS/Linux-only fonts are mapped via FONT_FALLBACK_WIN. The
+    separate ``ko`` slot prevents Korean text from inheriting a Chinese
+    fallback when the SVG does not specify a Korean font.
     """
     if not font_family_str:
-        return {'latin': 'Segoe UI', 'ea': 'Microsoft YaHei'}
+        return {
+            'latin': 'Segoe UI',
+            'ea': 'Microsoft YaHei',
+            'ko': 'Malgun Gothic',
+        }
 
     fonts = [f.strip().strip("'\"") for f in font_family_str.split(',')]
     latin_font = None
     ea_font = None
+    ko_font = None
 
     for font in fonts:
         if font in SYSTEM_FONTS:
@@ -414,42 +457,75 @@ def parse_font_family(font_family_str: str) -> dict[str, str]:
             continue
 
         win_font = FONT_FALLBACK_WIN.get(font, font)
-        if font in EA_FONTS:
+        if font in KOREAN_FONTS:
+            ko_font = ko_font or win_font
+            ea_font = ea_font or win_font
+        elif font in EA_FONTS:
             ea_font = ea_font or win_font
         else:
             latin_font = latin_font or win_font
 
-    # PPT renders CJK text via latin typeface when ea doesn't match
+    # PPT renders CJK text via latin typeface when ea doesn't match.
     if not latin_font and ea_font:
         latin_font = ea_font
 
     final_latin = latin_font or 'Segoe UI'
 
-    # EA must always be a CJK-capable font
+    # EA must always be a CJK-capable font.
     if not ea_font:
         ea_font = 'SimSun' if final_latin in _SERIF_LATIN else 'Microsoft YaHei'
 
-    return {'latin': final_latin, 'ea': ea_font}
+    # Korean uses a script-specific default rather than the Chinese EA fallback.
+    if not ko_font:
+        ko_font = 'Batang' if final_latin in _SERIF_LATIN else 'Malgun Gothic'
+
+    return {'latin': final_latin, 'ea': ea_font, 'ko': ko_font}
+
+
+def is_hangul_char(ch: str) -> bool:
+    """Check Hangul syllables, jamo, compatibility jamo, and extended jamo."""
+    cp = ord(ch)
+    return (
+        0x1100 <= cp <= 0x11FF
+        or 0x3130 <= cp <= 0x318F
+        or 0xFFA0 <= cp <= 0xFFDC
+        or 0xA960 <= cp <= 0xA97F
+        or 0xAC00 <= cp <= 0xD7A3
+        or 0xD7B0 <= cp <= 0xD7FF
+    )
 
 
 def is_cjk_char(ch: str) -> bool:
-    """Check if a character is CJK (Chinese/Japanese/Korean)."""
+    """Check if a character is CJK, including Korean Hangul blocks."""
     cp = ord(ch)
-    return (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or
-            0x2E80 <= cp <= 0x2EFF or 0x3000 <= cp <= 0x303F or
-            0xFF00 <= cp <= 0xFFEF or 0xF900 <= cp <= 0xFAFF or
-            0x20000 <= cp <= 0x2A6DF)
+    return (
+        is_hangul_char(ch)
+        or 0x4E00 <= cp <= 0x9FFF
+        or 0x3400 <= cp <= 0x4DBF
+        or 0x2E80 <= cp <= 0x2EFF
+        or 0x3000 <= cp <= 0x303F
+        or 0xFF00 <= cp <= 0xFFEF
+        or 0xF900 <= cp <= 0xFAFF
+        or 0x20000 <= cp <= 0x2A6DF
+    )
 
 
 def detect_text_lang(text: str) -> str:
     """Return a DrawingML language tag for a text run."""
-    return 'zh-CN' if any(is_cjk_char(ch) for ch in text) else 'en-US'
+    if any(is_hangul_char(ch) for ch in text):
+        return 'ko-KR'
+    if any(is_cjk_char(ch) for ch in text):
+        return 'zh-CN'
+    return 'en-US'
 
 
 def resolve_text_run_fonts(text: str, fonts: dict[str, str]) -> dict[str, str]:
     """Return DrawingML latin/ea/cs typefaces for one text run."""
     latin = fonts['latin']
-    if detect_text_lang(text) == 'zh-CN':
+    lang = detect_text_lang(text)
+    if lang == 'ko-KR':
+        ea = fonts.get('ko', 'Malgun Gothic')
+    elif lang == 'zh-CN':
         ea = fonts['ea']
     else:
         ea = latin
